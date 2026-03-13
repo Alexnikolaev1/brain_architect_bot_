@@ -25,10 +25,5 @@
     "MONGODB_DB": "@mongodb_db",
     "UPSTASH_REDIS_URL": "@upstash_redis_url",
     "UPSTASH_REDIS_PASSWORD": "@upstash_redis_password"
-  },
-  "functions": {
-    "api/webhook.py": {
-      "maxDuration": 25
-    }
   }
 }
