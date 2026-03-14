@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 _pg_pool: Any = None
 _redis_client: Any = None
+_pg_pool_loop_id: int | None = None
+_redis_client_loop_id: int | None = None
 
 _memory_users: dict[int, dict[str, Any]] = {}
 _memory_game_stats: list[dict[str, Any]] = []
@@ -40,7 +42,6 @@ _memory_game_stats: list[dict[str, Any]] = []
 _warned_memory_sql = False
 _warned_memory_redis = False
 _pg_schema_ready = False
-_pg_init_lock = asyncio.Lock()
 
 
 def _is_placeholder(value: str | None) -> bool:
@@ -127,12 +128,20 @@ def _use_memory_redis() -> bool:
 
 
 async def _get_pg_pool() -> Any:
-    global _pg_pool
+    global _pg_pool, _pg_pool_loop_id, _pg_schema_ready
     if _use_memory_sql():
         return None
 
     if asyncpg is None:
         raise RuntimeError("DATABASE_URL задан, но пакет 'asyncpg' не установлен.")
+
+    loop_id = id(asyncio.get_running_loop())
+    if _pg_pool is not None and _pg_pool_loop_id != loop_id:
+        # Vercel may recreate/close loops between invocations.
+        # Reset pool to avoid "Event loop is closed" on reused connections.
+        _pg_pool = None
+        _pg_pool_loop_id = None
+        _pg_schema_ready = False
 
     if _pg_pool is None:
         dsn = _get_postgres_dsn()
@@ -145,6 +154,7 @@ async def _get_pg_pool() -> Any:
             command_timeout=5,
             statement_cache_size=0,
         )
+        _pg_pool_loop_id = loop_id
     return _pg_pool
 
 
@@ -153,55 +163,51 @@ async def _ensure_pg_schema() -> None:
     if _pg_schema_ready:
         return
 
-    async with _pg_init_lock:
-        if _pg_schema_ready:
-            return
+    pool = await _get_pg_pool()
+    if pool is None:
+        return
 
-        pool = await _get_pg_pool()
-        if pool is None:
-            return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT NOT NULL DEFAULT '',
+                full_name TEXT NOT NULL DEFAULT '',
+                plan TEXT NOT NULL DEFAULT 'trial',
+                trial_start TIMESTAMPTZ,
+                sub_expires TIMESTAMPTZ,
+                xp INTEGER NOT NULL DEFAULT 0,
+                level INTEGER NOT NULL DEFAULT 1,
+                archetype TEXT NOT NULL DEFAULT 'oracle',
+                streak INTEGER NOT NULL DEFAULT 0,
+                last_session TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS game_stats (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                game_id TEXT NOT NULL,
+                played_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                score INTEGER NOT NULL,
+                time_ms INTEGER NOT NULL,
+                correct BOOLEAN NOT NULL,
+                difficulty INTEGER NOT NULL
+            );
+            """
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_game_stats_user_played ON game_stats(user_id, played_at DESC);"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_game_stats_game_user ON game_stats(game_id, user_id);"
+        )
 
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
-                    username TEXT NOT NULL DEFAULT '',
-                    full_name TEXT NOT NULL DEFAULT '',
-                    plan TEXT NOT NULL DEFAULT 'trial',
-                    trial_start TIMESTAMPTZ,
-                    sub_expires TIMESTAMPTZ,
-                    xp INTEGER NOT NULL DEFAULT 0,
-                    level INTEGER NOT NULL DEFAULT 1,
-                    archetype TEXT NOT NULL DEFAULT 'oracle',
-                    streak INTEGER NOT NULL DEFAULT 0,
-                    last_session TIMESTAMPTZ,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
-                """
-            )
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS game_stats (
-                    id BIGSERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    game_id TEXT NOT NULL,
-                    played_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    score INTEGER NOT NULL,
-                    time_ms INTEGER NOT NULL,
-                    correct BOOLEAN NOT NULL,
-                    difficulty INTEGER NOT NULL
-                );
-                """
-            )
-            await conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_game_stats_user_played ON game_stats(user_id, played_at DESC);"
-            )
-            await conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_game_stats_game_user ON game_stats(game_id, user_id);"
-            )
-
-        _pg_schema_ready = True
+    _pg_schema_ready = True
 
 
 def _user_row_to_doc(row: Any) -> dict[str, Any]:
@@ -234,10 +240,11 @@ def _game_row_to_doc(row: Any) -> dict[str, Any]:
 
 
 async def get_redis() -> Any:
-    global _redis_client, _warned_memory_redis
+    global _redis_client, _warned_memory_redis, _redis_client_loop_id
     if _use_memory_redis():
         if _redis_client is None:
             _redis_client = InMemoryRedis()
+            _redis_client_loop_id = None
         if not _warned_memory_redis:
             logger.warning("UPSTASH_REDIS_URL/REDIS_URL не задан. Используется in-memory storage для sessions/leaderboard.")
             _warned_memory_redis = True
@@ -245,6 +252,20 @@ async def get_redis() -> Any:
 
     if aioredis is None:
         raise RuntimeError("UPSTASH_REDIS_URL/REDIS_URL задан, но пакет 'redis' не установлен.")
+
+    loop_id = id(asyncio.get_running_loop())
+    if _redis_client is not None and _redis_client_loop_id != loop_id:
+        # Avoid reusing client from a previous closed event loop.
+        try:
+            close_method = getattr(_redis_client, "aclose", None) or getattr(_redis_client, "close", None)
+            if close_method is not None:
+                maybe_awaitable = close_method()
+                if asyncio.iscoroutine(maybe_awaitable):
+                    await maybe_awaitable
+        except Exception:  # noqa: BLE001
+            pass
+        _redis_client = None
+        _redis_client_loop_id = None
 
     if _redis_client is None:
         redis_url = _get_redis_url()
@@ -255,6 +276,7 @@ async def get_redis() -> Any:
             password=_get_redis_password(),
             decode_responses=True,
         )
+        _redis_client_loop_id = loop_id
     return _redis_client
 
 
