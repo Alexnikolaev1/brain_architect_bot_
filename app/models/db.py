@@ -2,15 +2,16 @@
 Storage access layer.
 
 Production:
-- MongoDB for users/game_stats
+- Postgres for users/game_stats
 - Redis for sessions/leaderboard
 
 Local fallback (when env vars are missing):
-- In-memory storage for both Mongo and Redis concerns
+- In-memory storage for both SQL and Redis concerns
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -24,20 +25,22 @@ except ModuleNotFoundError:  # optional in local mode
     aioredis = None
 
 try:
-    from motor.motor_asyncio import AsyncIOMotorClient
+    import asyncpg
 except ModuleNotFoundError:  # optional in local mode
-    AsyncIOMotorClient = None
+    asyncpg = None
 
 logger = logging.getLogger(__name__)
 
-_mongo_client: Any = None
+_pg_pool: Any = None
 _redis_client: Any = None
 
 _memory_users: dict[int, dict[str, Any]] = {}
 _memory_game_stats: list[dict[str, Any]] = []
 
-_warned_memory_mongo = False
+_warned_memory_sql = False
 _warned_memory_redis = False
+_pg_schema_ready = False
+_pg_init_lock = asyncio.Lock()
 
 
 def _is_placeholder(value: str | None) -> bool:
@@ -47,9 +50,32 @@ def _is_placeholder(value: str | None) -> bool:
     return (
         "your_" in lowered
         or "example" in lowered
-        or "user:password@cluster.mongodb.net" in lowered
         or "your-endpoint.upstash.io" in lowered
+        or "your-postgres-host" in lowered
     )
+
+
+def _get_postgres_dsn() -> str | None:
+    return (
+        os.environ.get("DATABASE_URL")
+        or os.environ.get("POSTGRES_URL")
+        or os.environ.get("POSTGRES_PRISMA_URL")
+    )
+
+
+def _get_redis_url() -> str | None:
+    return os.environ.get("UPSTASH_REDIS_URL") or os.environ.get("REDIS_URL")
+
+
+def _get_redis_password() -> str | None:
+    return os.environ.get("UPSTASH_REDIS_PASSWORD") or os.environ.get("REDIS_PASSWORD")
+
+
+def _warn_using_memory_sql() -> None:
+    global _warned_memory_sql
+    if not _warned_memory_sql:
+        logger.warning("DATABASE_URL/POSTGRES_URL не задан. Используется in-memory storage для users/game_stats.")
+        _warned_memory_sql = True
 
 
 class InMemoryRedis:
@@ -90,40 +116,121 @@ class InMemoryRedis:
         return [member for member, _ in items]
 
 
-def _use_memory_mongo() -> bool:
-    mongo_uri = os.environ.get("MONGODB_URI")
-    return _is_placeholder(mongo_uri)
+def _use_memory_sql() -> bool:
+    postgres_dsn = _get_postgres_dsn()
+    return _is_placeholder(postgres_dsn)
 
 
 def _use_memory_redis() -> bool:
-    redis_url = os.environ.get("UPSTASH_REDIS_URL")
+    redis_url = _get_redis_url()
     return _is_placeholder(redis_url)
 
 
-def get_mongo() -> Any:
-    global _mongo_client
-    if _use_memory_mongo():
+async def _get_pg_pool() -> Any:
+    global _pg_pool
+    if _use_memory_sql():
         return None
 
-    if AsyncIOMotorClient is None:
-        raise RuntimeError("MONGODB_URI задан, но пакет 'motor' не установлен.")
+    if asyncpg is None:
+        raise RuntimeError("DATABASE_URL задан, но пакет 'asyncpg' не установлен.")
 
-    if _mongo_client is None:
-        _mongo_client = AsyncIOMotorClient(
-            os.environ["MONGODB_URI"],
-            serverSelectionTimeoutMS=3000,
+    if _pg_pool is None:
+        dsn = _get_postgres_dsn()
+        if not dsn:
+            return None
+        _pg_pool = await asyncpg.create_pool(
+            dsn=dsn,
+            min_size=1,
+            max_size=3,
+            command_timeout=5,
+            statement_cache_size=0,
         )
-    return _mongo_client
+    return _pg_pool
 
 
-def get_db():
-    global _warned_memory_mongo
-    if _use_memory_mongo():
-        if not _warned_memory_mongo:
-            logger.warning("MONGODB_URI не задан. Используется in-memory storage для users/game_stats.")
-            _warned_memory_mongo = True
-        return None
-    return get_mongo()[os.environ.get("MONGODB_DB", "brain_architect")]
+async def _ensure_pg_schema() -> None:
+    global _pg_schema_ready
+    if _pg_schema_ready:
+        return
+
+    async with _pg_init_lock:
+        if _pg_schema_ready:
+            return
+
+        pool = await _get_pg_pool()
+        if pool is None:
+            return
+
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT NOT NULL DEFAULT '',
+                    full_name TEXT NOT NULL DEFAULT '',
+                    plan TEXT NOT NULL DEFAULT 'trial',
+                    trial_start TIMESTAMPTZ,
+                    sub_expires TIMESTAMPTZ,
+                    xp INTEGER NOT NULL DEFAULT 0,
+                    level INTEGER NOT NULL DEFAULT 1,
+                    archetype TEXT NOT NULL DEFAULT 'oracle',
+                    streak INTEGER NOT NULL DEFAULT 0,
+                    last_session TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS game_stats (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    game_id TEXT NOT NULL,
+                    played_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    score INTEGER NOT NULL,
+                    time_ms INTEGER NOT NULL,
+                    correct BOOLEAN NOT NULL,
+                    difficulty INTEGER NOT NULL
+                );
+                """
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_game_stats_user_played ON game_stats(user_id, played_at DESC);"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_game_stats_game_user ON game_stats(game_id, user_id);"
+            )
+
+        _pg_schema_ready = True
+
+
+def _user_row_to_doc(row: Any) -> dict[str, Any]:
+    return {
+        "_id": int(row["user_id"]),
+        "username": row["username"],
+        "full_name": row["full_name"],
+        "plan": row["plan"],
+        "trial_start": row["trial_start"],
+        "sub_expires": row["sub_expires"],
+        "xp": int(row["xp"]),
+        "level": int(row["level"]),
+        "archetype": row["archetype"],
+        "streak": int(row["streak"]),
+        "last_session": row["last_session"],
+        "created_at": row["created_at"],
+    }
+
+
+def _game_row_to_doc(row: Any) -> dict[str, Any]:
+    return {
+        "user_id": int(row["user_id"]),
+        "game_id": row["game_id"],
+        "played_at": row["played_at"],
+        "score": int(row["score"]),
+        "time_ms": int(row["time_ms"]),
+        "correct": bool(row["correct"]),
+        "difficulty": int(row["difficulty"]),
+    }
 
 
 async def get_redis() -> Any:
@@ -132,32 +239,49 @@ async def get_redis() -> Any:
         if _redis_client is None:
             _redis_client = InMemoryRedis()
         if not _warned_memory_redis:
-            logger.warning("UPSTASH_REDIS_URL не задан. Используется in-memory storage для sessions/leaderboard.")
+            logger.warning("UPSTASH_REDIS_URL/REDIS_URL не задан. Используется in-memory storage для sessions/leaderboard.")
             _warned_memory_redis = True
         return _redis_client
 
     if aioredis is None:
-        raise RuntimeError("UPSTASH_REDIS_URL задан, но пакет 'redis' не установлен.")
+        raise RuntimeError("UPSTASH_REDIS_URL/REDIS_URL задан, но пакет 'redis' не установлен.")
 
     if _redis_client is None:
+        redis_url = _get_redis_url()
+        if not redis_url:
+            raise RuntimeError("Не найден URL Redis (UPSTASH_REDIS_URL или REDIS_URL).")
         _redis_client = aioredis.from_url(
-            os.environ["UPSTASH_REDIS_URL"],
-            password=os.environ.get("UPSTASH_REDIS_PASSWORD"),
+            redis_url,
+            password=_get_redis_password(),
             decode_responses=True,
         )
     return _redis_client
 
 
 async def get_user(user_id: int) -> dict | None:
-    db = get_db()
-    if db is None:
+    if _use_memory_sql():
+        _warn_using_memory_sql()
         return _memory_users.get(user_id)
-    return await db.users.find_one({"_id": user_id})
+    await _ensure_pg_schema()
+    pool = await _get_pg_pool()
+    if pool is None:
+        return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT user_id, username, full_name, plan, trial_start, sub_expires,
+                   xp, level, archetype, streak, last_session, created_at
+            FROM users
+            WHERE user_id = $1
+            """,
+            int(user_id),
+        )
+    return _user_row_to_doc(row) if row else None
 
 
 async def upsert_user(user_id: int, **fields) -> None:
-    db = get_db()
-    if db is None:
+    if _use_memory_sql():
+        _warn_using_memory_sql()
         user = _memory_users.get(user_id)
         if user is None:
             user = {"_id": user_id, "created_at": datetime.now(timezone.utc)}
@@ -165,11 +289,42 @@ async def upsert_user(user_id: int, **fields) -> None:
         user.update(fields)
         return
 
-    await db.users.update_one(
-        {"_id": user_id},
-        {"$set": fields, "$setOnInsert": {"created_at": datetime.now(timezone.utc)}},
-        upsert=True,
-    )
+    await _ensure_pg_schema()
+    pool = await _get_pg_pool()
+    if pool is None:
+        return
+
+    allowed = {
+        "username",
+        "full_name",
+        "plan",
+        "trial_start",
+        "sub_expires",
+        "xp",
+        "level",
+        "archetype",
+        "streak",
+        "last_session",
+    }
+    cleaned = {k: v for k, v in fields.items() if k in allowed}
+
+    if not cleaned:
+        return
+
+    columns = ["user_id", "created_at"] + list(cleaned.keys())
+    values = [int(user_id), datetime.now(timezone.utc)] + [cleaned[k] for k in cleaned]
+    placeholders = ", ".join(f"${i}" for i in range(1, len(values) + 1))
+    col_sql = ", ".join(columns)
+    updates = ", ".join(f"{col} = EXCLUDED.{col}" for col in cleaned)
+
+    query = f"""
+        INSERT INTO users ({col_sql})
+        VALUES ({placeholders})
+        ON CONFLICT (user_id) DO UPDATE SET
+            {updates}
+    """
+    async with pool.acquire() as conn:
+        await conn.execute(query, *values)
 
 
 async def ensure_user(user_id: int, username: str, full_name: str) -> dict:
@@ -190,11 +345,36 @@ async def ensure_user(user_id: int, username: str, full_name: str) -> dict:
             "last_session": None,
             "created_at": now,
         }
-        db = get_db()
-        if db is None:
+        if _use_memory_sql():
+            _warn_using_memory_sql()
             _memory_users[user_id] = user
         else:
-            await db.users.insert_one(user)
+            await _ensure_pg_schema()
+            pool = await _get_pg_pool()
+            if pool is not None:
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        INSERT INTO users (
+                            user_id, username, full_name, plan, trial_start, sub_expires,
+                            xp, level, archetype, streak, last_session, created_at
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                        ON CONFLICT (user_id) DO NOTHING
+                        """,
+                        int(user_id),
+                        user["username"],
+                        user["full_name"],
+                        user["plan"],
+                        user["trial_start"],
+                        user["sub_expires"],
+                        int(user["xp"]),
+                        int(user["level"]),
+                        user["archetype"],
+                        int(user["streak"]),
+                        user["last_session"],
+                        user["created_at"],
+                    )
     else:
         if user.get("username") != username or user.get("full_name") != full_name:
             await upsert_user(user_id, username=username, full_name=full_name)
@@ -222,27 +402,67 @@ async def save_game_stat(
     }
     xp_gain = score * (2 if correct else 0)
 
-    db = get_db()
-    if db is None:
+    if _use_memory_sql():
+        _warn_using_memory_sql()
         _memory_game_stats.append(record)
         user = _memory_users.get(user_id)
         if user is not None:
             user["xp"] = int(user.get("xp", 0)) + xp_gain
         return
 
-    await db.game_stats.insert_one(record)
-    await db.users.update_one({"_id": user_id}, {"$inc": {"xp": xp_gain}})
+    await _ensure_pg_schema()
+    pool = await _get_pg_pool()
+    if pool is None:
+        return
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO game_stats (user_id, game_id, played_at, score, time_ms, correct, difficulty)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """,
+                int(user_id),
+                game_id,
+                record["played_at"],
+                int(score),
+                int(time_ms),
+                bool(correct),
+                int(difficulty),
+            )
+            await conn.execute(
+                """
+                UPDATE users
+                SET xp = COALESCE(xp, 0) + $2
+                WHERE user_id = $1
+                """,
+                int(user_id),
+                int(xp_gain),
+            )
 
 
 async def get_user_stats(user_id: int) -> list[dict]:
-    db = get_db()
-    if db is None:
+    if _use_memory_sql():
+        _warn_using_memory_sql()
         rows = [r for r in _memory_game_stats if r.get("user_id") == user_id]
         rows.sort(key=lambda x: x.get("played_at", datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
         return rows[:100]
 
-    cursor = db.game_stats.find({"user_id": user_id}).sort("played_at", -1).limit(100)
-    return await cursor.to_list(length=100)
+    await _ensure_pg_schema()
+    pool = await _get_pg_pool()
+    if pool is None:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT user_id, game_id, played_at, score, time_ms, correct, difficulty
+            FROM game_stats
+            WHERE user_id = $1
+            ORDER BY played_at DESC
+            LIMIT 100
+            """,
+            int(user_id),
+        )
+    return [_game_row_to_doc(row) for row in rows]
 
 
 async def set_session(user_id: int, data: dict, ttl: int = 3600) -> None:

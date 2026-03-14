@@ -54,8 +54,8 @@ def _is_placeholder(value: str | None) -> bool:
     return (
         "your_" in lowered
         or "example" in lowered
-        or "user:password@cluster.mongodb.net" in lowered
         or "your-endpoint.upstash.io" in lowered
+        or "your-postgres-host" in lowered
     )
 
 
@@ -128,9 +128,15 @@ async def _check_storage(write_checks: bool) -> None:
         update_leaderboard,
     )
 
+    postgres_url = (
+        os.environ.get("DATABASE_URL")
+        or os.environ.get("POSTGRES_URL")
+        or os.environ.get("POSTGRES_PRISMA_URL")
+    )
+    redis_url = os.environ.get("UPSTASH_REDIS_URL") or os.environ.get("REDIS_URL")
     has_external_storage = not (
-        _is_placeholder(os.environ.get("MONGODB_URI"))
-        and _is_placeholder(os.environ.get("UPSTASH_REDIS_URL"))
+        _is_placeholder(postgres_url)
+        and _is_placeholder(redis_url)
     )
     if has_external_storage and not write_checks:
         _ok("Storage checks skipped (external DB/Redis detected; use --write-checks to enable)")

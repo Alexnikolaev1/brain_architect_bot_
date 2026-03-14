@@ -21,11 +21,11 @@
 
 ### Важно
 
-- Для локальной разработки `MONGODB_URI` и `UPSTASH_REDIS_URL` теперь не обязательны.
+- Для локальной разработки `DATABASE_URL` (или `POSTGRES_URL`) и `UPSTASH_REDIS_URL` не обязательны.
 - Если они не заданы, бот автоматически работает в `in-memory` режиме:
   - пользователи/статистика/сессии/лидерборд хранятся в памяти процесса;
   - после перезапуска эти данные очищаются.
-- Для production оставь MongoDB + Redis как раньше.
+- Для production используй Postgres + Redis.
 
 ---
 
@@ -57,7 +57,7 @@
          │                    │
          ▼                    ▼
 ┌──────────────┐    ┌─────────────────────┐
-│ MongoDB Atlas│    │   Upstash Redis      │
+│   Postgres   │    │   Upstash Redis      │
 │              │    │                     │
 │ users        │    │ session:{uid}  TTL  │
 │ game_stats   │    │ leaderboard:{week}  │
@@ -71,9 +71,9 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  COLLECTION: users                                           │
+│  TABLE: users                                                │
 │  ─────────────────                                           │
-│  _id          : int        ← telegram user_id (PK)          │
+│  user_id      : bigint     ← telegram user_id (PK)          │
 │  username     : str                                          │
 │  full_name    : str                                          │
 │  plan         : enum       "free"|"trial"|"pro"|"vip"       │
@@ -88,10 +88,10 @@
 └──────────────────┬──────────────────────────────────────────┘
                    │ 1:N (user_id index)
 ┌──────────────────▼──────────────────────────────────────────┐
-│  COLLECTION: game_stats                                      │
+│  TABLE: game_stats                                           │
 │  ──────────────────────                                      │
-│  _id          : ObjectId   ← автогенерация                  │
-│  user_id      : int        ← FK → users._id                 │
+│  id           : bigint     ← автогенерация (PK)             │
+│  user_id      : bigint     ← FK → users.user_id             │
 │  game_id      : str        "double_strike"|"sensation_maze" │
 │                             "anti_realtor"|"stop_signal"    │
 │                             "blind_typing"                  │
@@ -102,10 +102,10 @@
 │  difficulty   : int        ← 1-10                           │
 └─────────────────────────────────────────────────────────────┘
 
-  Индексы MongoDB:
-  • users: { _id: 1 }
-  • game_stats: { user_id: 1, played_at: -1 }
-  • game_stats: { game_id: 1, user_id: 1 }
+  Индексы Postgres:
+  • users: PRIMARY KEY (user_id)
+  • game_stats: (user_id, played_at DESC)
+  • game_stats: (game_id, user_id)
 
 ┌─────────────────────────────────────────────────────────────┐
 │  REDIS KEYS (Upstash)                                        │
@@ -136,7 +136,7 @@ brain_architect/
 │   ├── keyboards/
 │   │   └── builder.py      ← Все InlineKeyboardMarkup
 │   ├── models/
-│   │   └── db.py           ← MongoDB + Redis: CRUD, sessions, leaderboard
+│   │   └── db.py           ← Postgres + Redis: CRUD, sessions, leaderboard
 │   ├── services/
 │   │   └── profile.py      ← Уровни, архетипы, статистика
 │   └── utils/
@@ -335,13 +335,11 @@ brain_architect/
 
 ### 1. Подготовка сервисов
 
-**MongoDB Atlas (бесплатный кластер M0):**
+**Postgres (Vercel Postgres / Neon):**
 ```bash
-# 1. Зарегистрируйся на cloud.mongodb.com
-# 2. Create Project → Build a Database → Free (M0)
-# 3. Security → Database Access → Add user
-# 4. Security → Network Access → Allow from anywhere (0.0.0.0/0)
-# 5. Connect → Drivers → Python → скопируй connection string
+# 1. В Vercel: Storage → Create Database → Postgres
+# 2. Либо в Neon: создайте проект и базу
+# 3. Скопируй connection string (postgresql://...sslmode=require)
 ```
 
 **Upstash Redis (бесплатный план):**
@@ -373,8 +371,7 @@ vercel
 
 # Добавь секреты
 vercel env add TELEGRAM_BOT_TOKEN
-vercel env add MONGODB_URI
-vercel env add MONGODB_DB
+vercel env add DATABASE_URL
 vercel env add UPSTASH_REDIS_URL
 vercel env add UPSTASH_REDIS_PASSWORD
 
@@ -392,23 +389,24 @@ python scripts/set_webhook.py https://your-project.vercel.app/api/webhook
 python scripts/set_webhook.py
 ```
 
-### 4. Создание индексов MongoDB
+### 4. Создание индексов Postgres
 
-```javascript
-// В MongoDB Atlas → Browse Collections → + New Collection
-// Вставь в mongosh или Compass:
+```sql
+-- Обычно создаются автоматически при старте приложения.
+-- При ручной инициализации можно выполнить:
+CREATE INDEX IF NOT EXISTS idx_game_stats_user_played
+ON game_stats(user_id, played_at DESC);
 
-db.game_stats.createIndex({ user_id: 1, played_at: -1 })
-db.game_stats.createIndex({ game_id: 1, user_id: 1 })
-db.users.createIndex({ plan: 1, sub_expires: 1 })
+CREATE INDEX IF NOT EXISTS idx_game_stats_game_user
+ON game_stats(game_id, user_id);
 ```
 
 ### 5. Ограничения Vercel и их решения
 
 | Проблема | Решение |
 |---|---|
-| Таймаут 25с (Pro) / 10с (Hobby) | Все операции < 5с: Redis sync, MongoDB async |
-| Stateless функции | Состояние в Redis (session) и MongoDB (users) |
+| Таймаут 25с (Pro) / 10с (Hobby) | Все операции < 5с: Redis + Postgres async |
+| Stateless функции | Состояние в Redis (session) и Postgres (users/game_stats) |
 | Cold start ~500ms | Переиспользуем `_application` singleton |
 | Нет cron на Hobby | Используй Vercel Cron (Pro) или GitHub Actions |
 
@@ -450,7 +448,7 @@ db.users.createIndex({ plan: 1, sub_expires: 1 })
 ```
 MVP (Месяц 1)
 ├── ✅ 5 игр с базовой механикой
-├── ✅ MongoDB + Redis
+├── ✅ Postgres + Redis
 ├── ✅ Telegram Stars оплата
 ├── ✅ Профиль + XP + уровни
 └── ✅ Статистика по играм
